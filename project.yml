@@ -1,0 +1,122 @@
+name: Nagare
+
+options:
+  bundleIdPrefix: com.anony
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+
+packages:
+  # トレントエンジン（libtorrent 2.1.1 をビルド済みバイナリで取り込む。BSD-3-Clause）
+  LibtorrentKit:
+    url: https://github.com/WhoSayIn/LibtorrentKit
+    exactVersion: 0.5.2
+  # 動画プレイヤー（libmpv / FFmpeg / libass。LGPL 版）
+  MPVKit:
+    url: https://github.com/mpvkit/MPVKit
+    exactVersion: 1.0.0
+
+targets:
+  Nagare:
+    type: application
+    platform: iOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: Source
+      - path: Resources/Bundle
+        buildPhase: resources
+    info:
+      path: Resources/Info.plist
+      properties:
+        CFBundleDisplayName: Nagare
+        CFBundleName: $(PRODUCT_NAME)
+        CFBundleIdentifier: $(PRODUCT_BUNDLE_IDENTIFIER)
+        CFBundleExecutable: $(EXECUTABLE_NAME)
+        CFBundlePackageType: APPL
+        CFBundleShortVersionString: "1.0.4"
+        CFBundleVersion: "5"
+        LSRequiresIPhoneOS: true
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        # 再生中・ダウンロード中にバックグラウンドで止まらないようにする（entitlement 不要）
+        UIBackgroundModes:
+          - audio
+        # 拡張機能は任意のサイトへ http/https でアクセスするため
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        NSLocalNetworkUsageDescription: トレントの接続性を上げるため、ルーターへのポート開放要求（NAT-PMP）にローカルネットワークを使います。
+        # Documents（ダウンロードしたファイル・ログ）を「ファイル」アプリから見られるようにする
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        ITSAppUsesNonExemptEncryption: false
+    settings:
+      base:
+        PRODUCT_NAME: Nagare
+        PRODUCT_BUNDLE_IDENTIFIER: com.anony.nagare
+        TARGETED_DEVICE_FAMILY: "1,2"
+        GENERATE_INFOPLIST_FILE: NO
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        SWIFT_VERSION: "5.0"
+        SWIFT_STRICT_CONCURRENCY: minimal
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        CODE_SIGN_STYLE: Automatic
+        DEBUG_INFORMATION_FORMAT: dwarf-with-dsym
+    dependencies:
+      - package: LibtorrentKit
+        product: LibtorrentKit
+      - package: MPVKit
+        product: MPVKit
+    postBuildScripts:
+      # LibtorrentKit は OpenSSL.framework（動的）に依存する。
+      # SPM のバイナリターゲットは通常 Xcode が自動で埋め込むが、
+      # 入っていないと起動直後に dyld で落ちるので、ここで確認して
+      # 無ければ DerivedData から補う。結果は xcodebuild のログに出る。
+      - name: Verify embedded OpenSSL
+        basedOnDependencyAnalysis: false
+        script: |
+          set -u
+          FW_DIR="${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}"
+          echo "[Nagare] Frameworks: ${FW_DIR}"
+          ls -1 "${FW_DIR}" 2>/dev/null || echo "[Nagare] (Frameworks フォルダなし)"
+          if [ -d "${FW_DIR}/OpenSSL.framework" ]; then
+            echo "[Nagare] OK: OpenSSL.framework は埋め込み済み"
+          else
+            echo "warning: [Nagare] OpenSSL.framework が埋め込まれていません。DerivedData から補います"
+            DD_ROOT="${BUILD_DIR%/Build/*}"
+            SRC=$(find "${BUILT_PRODUCTS_DIR}" "${DD_ROOT}" -type d -name OpenSSL.framework -path "*ios-arm64/*" 2>/dev/null | head -1)
+            [ -z "${SRC}" ] && SRC=$(find "${BUILT_PRODUCTS_DIR}" -maxdepth 2 -type d -name OpenSSL.framework 2>/dev/null | head -1)
+            if [ -n "${SRC}" ]; then
+              mkdir -p "${FW_DIR}"
+              ditto "${SRC}" "${FW_DIR}/OpenSSL.framework"
+              echo "[Nagare] copied: ${SRC}"
+            else
+              echo "error: [Nagare] OpenSSL.framework が見つかりません"
+              exit 1
+            fi
+          fi
+          echo "[Nagare] otool -L (ssl/crypto):"
+          otool -L "${TARGET_BUILD_DIR}/${EXECUTABLE_PATH}" | grep -iE "ssl|crypto" || echo "[Nagare] (動的リンクの ssl/crypto なし)"
+          # MPVKit も OpenSSL（静的）を持っているため、libtorrent 側の参照が
+          # どちらに結び付いたかを記録しておく（undefined = OpenSSL.framework から動的に取る）
+          echo "[Nagare] OpenSSL シンボルの結び付き:"
+          nm -m "${TARGET_BUILD_DIR}/${EXECUTABLE_PATH}" 2>/dev/null | grep -E " _(SSL_CTX_new|OPENSSL_init_ssl|OpenSSL_version)$" || echo "[Nagare] (該当シンボルなし)"
+
+schemes:
+  Nagare:
+    build:
+      targets:
+        Nagare: all
+    run:
+      config: Debug
+    archive:
+      config: Release

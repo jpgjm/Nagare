@@ -1,0 +1,17 @@
+# Xcode / XcodeGen 生成物
+*.xcodeproj/
+*.xcworkspace/
+build/
+DerivedData/
+SourcePackages/
+.swiftpm/
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# macOS
+.DS_Store
+
+# 秘密情報（リポジトリに含めない）
+*.secret
+Secrets/

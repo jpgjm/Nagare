@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Nagare extension host</title>
+</head>
+<body>
+<script>
+'use strict'
+// ---------------------------------------------------------------------------
+// Nagare 拡張機能ランタイム
+//
+// Shiru の common/modules/extensions/worker.js を WKWebView 上で動かすための土台。
+// - 拡張のコード（ES モジュール）は Blob URL にして import() する
+// - fetch はネイティブ（URLSession）へ中継する。Android 版の CapacitorHttp と同様に
+//   CORS の制約を受けない
+// - console.* はネイティブのログ（ログタブ）へ流す
+// ---------------------------------------------------------------------------
+;(() => {
+  const native = window.webkit.messageHandlers
+
+  // ---- ログ -----------------------------------------------------------------
+  const fmt = args => args.map(a => {
+    if (a instanceof Error) return a.stack || a.message
+    if (typeof a === 'object') { try { return JSON.stringify(a) } catch { return String(a) } }
+    return String(a)
+  }).join(' ')
+  const sendLog = (level, args) => { try { native.nagareLog.postMessage({ level, message: fmt(args).slice(0, 4000) }) } catch {} }
+  console.log = (...a) => sendLog('debug', a)
+  console.debug = (...a) => sendLog('debug', a)
+  console.info = (...a) => sendLog('info', a)
+  console.warn = (...a) => sendLog('warn', a)
+  console.error = (...a) => sendLog('error', a)
+  window.addEventListener('error', e => sendLog('error', ['未捕捉の例外:', e.message, e.filename + ':' + e.lineno]))
+  window.addEventListener('unhandledrejection', e => sendLog('warn', ['未処理の Promise 拒否:', e.reason]))
+
+  // ---- base64 ---------------------------------------------------------------
+  const toBase64 = u8 => {
+    let s = ''
+    const chunk = 0x8000
+    for (let i = 0; i < u8.length; i += chunk) s += String.fromCharCode.apply(null, u8.subarray(i, i + chunk))
+    return btoa(s)
+  }
+  const fromBase64 = b64 => {
+    if (!b64) return new Uint8Array(0)
+    const s = atob(b64)
+    const u8 = new Uint8Array(s.length)
+    for (let i = 0; i < s.length; i++) u8[i] = s.charCodeAt(i)
+    return u8
+  }
+
+  // ---- fetch をネイティブへ中継 -----------------------------------------------
+  const encoder = new TextEncoder()
+  async function nativeFetch(input, init = {}) {
+    init = init || {}
+    let url
+    let method = 'GET'
+    const headers = {}
+    let body = null
+    if (input instanceof Request) {
+      url = input.url
+      method = input.method
+      input.headers.forEach((v, k) => { headers[k] = v })
+      if (method !== 'GET' && method !== 'HEAD') body = new Uint8Array(await input.arrayBuffer())
+    } else {
+      url = String(input)
+    }
+    if (init.method) method = String(init.method).toUpperCase()
+    if (init.headers) new Headers(init.headers).forEach((v, k) => { headers[k] = v })
+    if (init.body != null) {
+      const b = init.body
+      if (typeof b === 'string') body = encoder.encode(b)
+      else if (b instanceof URLSearchParams) {
+        body = encoder.encode(b.toString())
+        if (!headers['content-type']) headers['content-type'] = 'application/x-www-form-urlencoded;charset=UTF-8'
+      } else if (b instanceof ArrayBuffer) body = new Uint8Array(b)
+      else if (ArrayBuffer.isView(b)) body = new Uint8Array(b.buffer, b.byteOffset, b.byteLength)
+      else if (b instanceof Blob) {
+        body = new Uint8Array(await b.arrayBuffer())
+        if (!headers['content-type'] && b.type) headers['content-type'] = b.type
+      } else if (b instanceof FormData) {
+        const r = new Request('https://extensions.nagare.invalid/', { method: 'POST', body: b })
+        body = new Uint8Array(await r.arrayBuffer())
+        headers['content-type'] = r.headers.get('content-type')
+      } else body = encoder.encode(String(b))
+    }
+    url = new URL(url, location.href).href
+    if (init.signal && init.signal.aborted) throw new DOMException('The operation was aborted.', 'AbortError')
+
+    const pending = native.nagareFetch.postMessage({ url, method, headers, body: body ? toBase64(body) : null })
+    const res = init.signal
+      ? await Promise.race([pending, new Promise((_, reject) => init.signal.addEventListener('abort', () => reject(new DOMException('The operation was aborted.', 'AbortError')), { once: true }))])
+      : await pending
+    if (!res || res.error) throw new TypeError('Failed to fetch: ' + (res ? res.error : 'no response'))
+    const status = (res.status >= 200 && res.status <= 599) ? res.status : 502
+    const nullBody = [204, 205, 304].includes(status) || method === 'HEAD'
+    // Response の headers / statusText は不正な文字（改行・Latin-1 外）があると例外になるので 1 つずつ入れる
+    const safeHeaders = new Headers()
+    for (const [k, v] of Object.entries(res.headers || {})) {
+      try { safeHeaders.append(k, String(v)) } catch { sendLog('debug', ['不正なレスポンスヘッダを無視:', k]) }
+    }
+    const statusText = String(res.statusText || '').replace(/[^\t\x20-\x7e]/g, '')
+    const response = new Response(nullBody ? null : fromBase64(res.body), { status, statusText, headers: safeHeaders })
+    try { Object.defineProperty(response, 'url', { value: res.url }) } catch {}
+    try { Object.defineProperty(response, 'redirected', { value: !!res.redirected }) } catch {}
+    return response
+  }
+  window.fetch = nativeFetch
+  globalThis.fetch = nativeFetch
+
+  // ---- IndexedDB ------------------------------------------------------------
+  // nekoBT / TsukiHime はモジュールの先頭で IndexedDB を開く（top-level await）。
+  // 使えない環境だとモジュールの読み込みごと失敗するので、起動時に確かめて
+  // 使えなければメモリ上の簡易実装（keyval 用途に必要な分だけ）に差し替える。
+  function makeMemoryIndexedDB() {
+    const databases = new Map()
+    const request = fn => {
+      const r = { result: undefined, error: null, onsuccess: null, onerror: null, readyState: 'pending' }
+      setTimeout(() => {
+        try { r.result = fn(); r.readyState = 'done'; if (r.onsuccess) r.onsuccess({ target: r }) }
+        catch (e) { r.error = e; r.readyState = 'done'; if (r.onerror) r.onerror({ target: r }) }
+      }, 0)
+      return r
+    }
+    const makeDB = (name, version) => {
+      const stores = new Map()
+      return {
+        name,
+        version: version || 1,
+        objectStoreNames: { contains: n => stores.has(n), get length() { return stores.size } },
+        createObjectStore(n) { if (!stores.has(n)) stores.set(n, new Map()); return {} },
+        transaction(names) {
+          return {
+            objectStore(n) {
+              const store = stores.get(n)
+              if (!store) throw new DOMException('No objectStore named ' + n, 'NotFoundError')
+              return {
+                get: k => request(() => store.get(k)),
+                put: (v, k) => request(() => { store.set(k, v); return k }),
+                delete: k => request(() => { store.delete(k) }),
+                clear: () => request(() => { store.clear() }),
+                getAllKeys: () => request(() => [...store.keys()])
+              }
+            }
+          }
+        },
+        close() {}
+      }
+    }
+    return {
+      open(name, version) {
+        const r = { result: null, error: null, onsuccess: null, onerror: null, onupgradeneeded: null, onblocked: null, readyState: 'pending' }
+        setTimeout(() => {
+          let db = databases.get(name)
+          const created = !db
+          if (!db) { db = makeDB(name, version); databases.set(name, db) }
+          r.result = db
+          if (created && r.onupgradeneeded) r.onupgradeneeded({ target: r, oldVersion: 0, newVersion: version || 1 })
+          r.readyState = 'done'
+          if (r.onsuccess) r.onsuccess({ target: r })
+        }, 0)
+        return r
+      },
+      deleteDatabase(name) { databases.delete(name); return request(() => undefined) }
+    }
+  }
+
+  const indexedDBReady = (async () => {
+    try {
+      if (!window.indexedDB) throw new Error('indexedDB が存在しません')
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('3 秒以内に開けませんでした')), 3000)
+        const r = window.indexedDB.open('nagare-probe', 1)
+        r.onupgradeneeded = () => { try { r.result.createObjectStore('probe') } catch {} }
+        r.onsuccess = () => { clearTimeout(timer); try { r.result.close() } catch {}; resolve() }
+        r.onerror = () => { clearTimeout(timer); reject(r.error || new Error('open 失敗')) }
+        r.onblocked = () => { clearTimeout(timer); resolve() }
+      })
+      sendLog('info', ['IndexedDB: 利用可能'])
+    } catch (e) {
+      const shim = makeMemoryIndexedDB()
+      try { Object.defineProperty(window, 'indexedDB', { value: shim, configurable: true, writable: true }) } catch { try { window.indexedDB = shim } catch {} }
+      sendLog('warn', ['IndexedDB が使えないため、メモリ上の代替に切り替えました（拡張のキャッシュはアプリ終了で消えます）:', e])
+    }
+  })()
+
+  // ---- 拡張の管理 -------------------------------------------------------------
+  const sources = new Map()
+  const errorMessage = e => (e && (e.message || e.toString())) || String(e)
+  const withTimeout = (promise, ms, label) => Promise.race([
+    Promise.resolve(promise),
+    new Promise((_, reject) => setTimeout(() => reject(new Error(label + ' が ' + (ms / 1000) + ' 秒以内に終わりませんでした')), ms))
+  ])
+  const isStubModule = code => {
+    const stripped = code.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '').trim()
+    return !/(class|function|async\s+function|=>)/.test(stripped)
+  }
+  const num = v => { const n = Number(v); return Number.isFinite(n) ? n : 0 }
+  const normalizeDate = d => {
+    if (d == null) return null
+    const date = d instanceof Date ? d : new Date(d)
+    return isNaN(+date) ? null : date.toISOString()
+  }
+  const normalizeResult = r => ({
+    title: String(r?.title ?? ''),
+    link: String(r?.link ?? ''),
+    id: r?.id ?? null,
+    seeders: num(r?.seeders),
+    leechers: num(r?.leechers),
+    downloads: num(r?.downloads),
+    accuracy: r?.accuracy ?? null,
+    hash: String(r?.hash ?? ''),
+    size: num(r?.size),
+    date: normalizeDate(r?.date),
+    type: r?.type ?? null
+  })
+
+  window.__nagare = {
+    async load(id, code, settings) {
+      await indexedDBReady
+      try {
+        const blob = new Blob([code], { type: 'text/javascript' })
+        const blobUrl = URL.createObjectURL(blob)
+        let mod
+        try { mod = await withTimeout(import(blobUrl), 30000, 'モジュールの読み込み') } finally { URL.revokeObjectURL(blobUrl) }
+        const source = mod && mod.default
+        if (!source) return JSON.stringify({ error: 'default export がありません', stub: isStubModule(code) })
+        // anitomyscript は初版では提供しない（拡張側が使う場合は undefined になる）
+        if (settings && Object.keys(settings).length) source.settings = settings
+        sources.set(id, source)
+        let ok = false
+        try {
+          ok = !!(await withTimeout(source.validate(), 20000, 'validate()'))
+        } catch (e) {
+          return JSON.stringify({ error: 'validate() が失敗: ' + errorMessage(e) })
+        }
+        return JSON.stringify(ok ? { validated: true } : { error: 'ソースに到達できません（validate() が false を返しました）' })
+      } catch (e) {
+        return JSON.stringify({ error: errorMessage(e), stub: isStubModule(code) })
+      }
+    },
+
+    async validate(id) {
+      const source = sources.get(id)
+      if (!source) return JSON.stringify({ error: '読み込まれていません' })
+      try {
+        const ok = !!(await withTimeout(source.validate(), 20000, 'validate()'))
+        return JSON.stringify(ok ? { validated: true } : { error: 'validate() が false を返しました' })
+      } catch (e) {
+        return JSON.stringify({ error: errorMessage(e) })
+      }
+    },
+
+    updateSettings(id, settings) {
+      const source = sources.get(id)
+      if (source) source.settings = settings || {}
+      return JSON.stringify({ ok: !!source })
+    },
+
+    unload(id) {
+      sources.delete(id)
+      return JSON.stringify({ ok: true })
+    },
+
+    async query(id, options, types) {
+      const source = sources.get(id)
+      if (!source) return JSON.stringify({ results: [], errors: ['拡張が読み込まれていません'] })
+      const tasks = [['single', () => source.single(options)]]
+      if (types && types.movie) tasks.push(['movie', () => source.movie(options)])
+      if (types && types.batch) tasks.push(['batch', () => source.batch(options)])
+      const settled = await Promise.allSettled(tasks.map(([name, fn]) =>
+        withTimeout((async () => fn())(), 120000, name + '()').then(v => ({ name, value: v }))
+      ))
+      const results = []
+      const errors = []
+      settled.forEach((s, i) => {
+        const name = tasks[i][0]
+        if (s.status === 'fulfilled') {
+          const list = Array.isArray(s.value.value) ? s.value.value : []
+          for (const r of list) {
+            const n = normalizeResult(r)
+            n.searchType = name
+            results.push(n)
+          }
+        } else {
+          errors.push(name + ': ' + errorMessage(s.reason))
+        }
+      })
+      return JSON.stringify({ results, errors })
+    }
+  }
+
+  sendLog('info', ['拡張ランタイム準備完了', navigator.userAgent])
+})()
+</script>
+</body>
+</html>
